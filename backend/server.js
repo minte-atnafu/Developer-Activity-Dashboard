@@ -1,6 +1,7 @@
 const { ApolloServer, gql } = require('apollo-server');
 const axios = require('axios');
 const NodeCache = require('node-cache');
+require('dotenv').config(); // <-- load .env variables
 
 // Cache for API responses (5 minutes TTL)
 const cache = new NodeCache({ stdTTL: 300 });
@@ -30,66 +31,29 @@ const typeDefs = gql`
   }
 `;
 
-// Resolvers define the technique for fetching the types defined in the schema
+// Resolvers
 const resolvers = {
   Query: {
     activities: async (_, { source, limit = 20, offset = 0, fromDate, toDate }) => {
       try {
         console.log('Fetching activities with params:', { source, limit, offset, fromDate, toDate });
         
-        // Fetch data from both sources
         const [githubData, stackoverflowData] = await Promise.allSettled([
           fetchGitHubActivity(),
           fetchStackOverflowActivity()
         ]);
 
-        console.log('GitHub data status:', githubData.status);
-        console.log('StackOverflow data status:', stackoverflowData.status);
-
-        // Combine and normalize data
         let allActivities = [];
-        
-        if (githubData.status === 'fulfilled') {
-          allActivities = allActivities.concat(githubData.value);
-        } else {
-          console.error('GitHub API error:', githubData.reason);
-        }
-        
-        if (stackoverflowData.status === 'fulfilled') {
-          allActivities = allActivities.concat(stackoverflowData.value);
-        } else {
-          console.error('StackOverflow API error:', stackoverflowData.reason);
-        }
 
-        console.log('Total activities before filtering:', allActivities.length);
+        if (githubData.status === 'fulfilled') allActivities = allActivities.concat(githubData.value);
+        if (stackoverflowData.status === 'fulfilled') allActivities = allActivities.concat(stackoverflowData.value);
 
-        // Apply filters
-        if (source) {
-          allActivities = allActivities.filter(activity => activity.source === source);
-          console.log('Activities after source filter:', allActivities.length);
-        }
+        if (source) allActivities = allActivities.filter(a => a.source === source);
+        if (fromDate) allActivities = allActivities.filter(a => new Date(a.timestamp) >= new Date(fromDate));
+        if (toDate) allActivities = allActivities.filter(a => new Date(a.timestamp) <= new Date(toDate));
 
-        // Apply date filters if provided
-        if (fromDate) {
-          const from = new Date(fromDate);
-          allActivities = allActivities.filter(activity => new Date(activity.timestamp) >= from);
-          console.log('Activities after fromDate filter:', allActivities.length);
-        }
-
-        if (toDate) {
-          const to = new Date(toDate);
-          allActivities = allActivities.filter(activity => new Date(activity.timestamp) <= to);
-          console.log('Activities after toDate filter:', allActivities.length);
-        }
-
-        // Sort by timestamp (newest first)
         allActivities.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
-        // Apply pagination
-        const result = allActivities.slice(offset, offset + limit);
-        console.log('Final result count:', result.length);
-        
-        return result;
+        return allActivities.slice(offset, offset + limit);
       } catch (error) {
         console.error('Error in activities resolver:', error);
         throw new Error('Failed to fetch activities: ' + error.message);
@@ -102,32 +66,22 @@ const resolvers = {
 async function fetchGitHubActivity() {
   const cacheKey = 'github_activity';
   const cachedData = cache.get(cacheKey);
-  
-  if (cachedData) {
-    console.log('Returning cached GitHub data');
-    return cachedData;
-  }
+  if (cachedData) return cachedData;
 
   try {
-    // Use environment variable or fallback
-    const username = process.env.GITHUB_USERNAME || 'torvalds'; // Default to Linus Torvalds for testing
-    const token = process.env.GITHUB_TOKEN || '';
-    
-    console.log('Fetching GitHub activity for user:', username);
-    
+    const username = process.env.GITHUB_USERNAME;
+    const token = process.env.GITHUB_TOKEN;
+
+    if (!username || !token) throw new Error('GITHUB_USERNAME or GITHUB_TOKEN not set in .env');
+
     const config = {
       headers: {
-        'User-Agent': 'Developer-Activity-Dashboard'
+        'User-Agent': 'Developer-Activity-Dashboard',
+        'Authorization': `Bearer ${token}` // use Bearer token
       }
     };
-    
-    // Add authorization header if token is provided
-    if (token) {
-      config.headers.Authorization = `token ${token}`;
-    }
-    
+
     const response = await axios.get(`https://api.github.com/users/${username}/events`, config);
-    console.log('GitHub API response status:', response.status);
 
     const activities = response.data.map(event => {
       let activity = {
@@ -168,14 +122,9 @@ async function fetchGitHubActivity() {
     });
 
     cache.set(cacheKey, activities);
-    console.log('Fetched', activities.length, 'GitHub activities');
     return activities;
   } catch (error) {
     console.error('GitHub API error:', error.message);
-    if (error.response) {
-      console.error('GitHub API response status:', error.response.status);
-      console.error('GitHub API response data:', error.response.data);
-    }
     return [];
   }
 }
@@ -184,73 +133,58 @@ async function fetchGitHubActivity() {
 async function fetchStackOverflowActivity() {
   const cacheKey = 'stackoverflow_activity';
   const cachedData = cache.get(cacheKey);
-  
-  if (cachedData) {
-    console.log('Returning cached StackOverflow data');
-    return cachedData;
-  }
+  if (cachedData) return cachedData;
 
   try {
-    // Use a default user ID for testing
-    const userId = process.env.STACKOVERFLOW_USER_ID || '22656'; // Default to Jon Skeet's ID for testing
-    
-    console.log('Fetching StackOverflow activity for user ID:', userId);
-    
-    const response = await axios.get(
-      `https://api.stackexchange.com/2.3/users/${userId}/activity?site=stackoverflow`
-    );
-    
-    console.log('StackOverflow API response status:', response.status);
+    const userId = process.env.STACKOVERFLOW_USER_ID;
+    if (!userId) throw new Error('STACKOVERFLOW_USER_ID not set in .env');
 
-    const activities = response.data.items.map(item => {
-      const activity = {
-        id: item.post_id || item.question_id || `so-${Date.now()}-${Math.random()}`,
+    const [questionsRes, answersRes] = await Promise.all([
+      axios.get(`https://api.stackexchange.com/2.3/users/${userId}/questions?order=desc&sort=creation&site=stackoverflow`),
+      axios.get(`https://api.stackexchange.com/2.3/users/${userId}/answers?order=desc&sort=creation&site=stackoverflow`)
+    ]);
+
+    const activities = [];
+
+    questionsRes.data.items.forEach(q => {
+      activities.push({
+        id: `q-${q.question_id}`,
         source: 'stackoverflow',
-        timestamp: new Date((item.creation_date || item.last_activity_date) * 1000).toISOString(),
-        type: item.post_type || 'activity'
-      };
+        type: 'question',
+        title: `Asked: ${q.title}`,
+        url: q.link,
+        timestamp: new Date(q.creation_date * 1000).toISOString(),
+        tags: q.tags
+      });
+    });
 
-      if (item.post_type === 'answer') {
-        activity.type = 'answer';
-        activity.title = `Answered: ${item.title}`;
-        activity.url = item.link;
-      } else if (item.post_type === 'question') {
-        activity.type = 'question';
-        activity.title = `Asked: ${item.title}`;
-        activity.url = item.link;
-      } else {
-        activity.type = 'activity';
-        activity.title = `StackOverflow activity: ${item.activity_type}`;
-      }
-
-      if (item.tags) {
-        activity.tags = item.tags;
-      }
-
-      return activity;
+    answersRes.data.items.forEach(a => {
+      activities.push({
+        id: `a-${a.answer_id}`,
+        source: 'stackoverflow',
+        type: 'answer',
+        title: `Answered question ID: ${a.question_id}`,
+        url: a.link,
+        timestamp: new Date(a.creation_date * 1000).toISOString(),
+      });
     });
 
     cache.set(cacheKey, activities);
-    console.log('Fetched', activities.length, 'StackOverflow activities');
     return activities;
-  } catch (error) {
-    console.error('StackOverflow API error:', error.message);
-    if (error.response) {
-      console.error('StackOverflow API response status:', error.response.status);
-      console.error('StackOverflow API response data:', error.response.data);
-    }
+  } catch (err) {
+    console.error('StackOverflow API error:', err.message);
     return [];
   }
 }
 
-// Create the Apollo Server with CORS enabled
+// Apollo Server
 const server = new ApolloServer({
   typeDefs,
   resolvers,
   introspection: true,
   playground: true,
   cors: {
-    origin: ['http://localhost:3000', 'https://studio.apollographql.com'], // Allow React app and Apollo Studio
+    origin: ['http://localhost:3000', 'https://studio.apollographql.com'],
     credentials: true,
   },
   formatError: (error) => {
@@ -259,7 +193,7 @@ const server = new ApolloServer({
   },
 });
 
-// Start the server
+// Start server
 server.listen({ port: process.env.PORT || 4000 }).then(({ url }) => {
   console.log(`🚀 Server ready at ${url}`);
   console.log(`📋 Playground available at ${url}graphql`);
